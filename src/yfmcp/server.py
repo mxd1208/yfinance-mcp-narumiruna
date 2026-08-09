@@ -1,5 +1,7 @@
 import asyncio
+import math
 from datetime import datetime
+from numbers import Real
 from typing import Annotated
 from typing import Any
 
@@ -10,7 +12,11 @@ from mcp.types import ImageContent
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from yfinance.const import SECTOR_INDUSTY_MAPPING
+from yfinance.exceptions import YFDataException
+from yfinance.exceptions import YFInvalidPeriodError
+from yfinance.exceptions import YFPricesMissingError
 from yfinance.exceptions import YFRateLimitError
+from yfinance.exceptions import YFTzMissingError
 
 from yfmcp.chart import generate_chart
 from yfmcp.screener import build_screener_query
@@ -36,6 +42,28 @@ _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
     YFRateLimitError,
 )
 
+_ANALYST_ESTIMATE_SECTIONS: dict[str, tuple[str, str | None, bool]] = {
+    "recommendations": ("recommendations", None, False),
+    "earnings_estimate": ("earnings_estimate", "period", False),
+    "revenue_estimate": ("revenue_estimate", "period", False),
+    "eps_trend": ("eps_trend", "period", False),
+    "eps_revisions": ("eps_revisions", "period", False),
+    "earnings_history": ("earnings_history", "date", True),
+    "growth_estimates": ("growth_estimates", "period", False),
+}
+
+_FUND_DATA_SECTIONS = {
+    "description",
+    "fund_overview",
+    "fund_operations",
+    "asset_classes",
+    "top_holdings",
+    "equity_holdings",
+    "bond_holdings",
+    "bond_ratings",
+    "sector_weightings",
+}
+
 
 def _is_retryable_yfinance_error(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_YFINANCE_EXCEPTIONS)
@@ -54,9 +82,243 @@ def _create_retryable_error_response(action: str, exc: BaseException, details: d
     return create_error_response(message, error_code="NETWORK_ERROR", details={**details, "exception": str(exc)})
 
 
+def _price_history_details(
+    symbol: str,
+    period: Period,
+    interval: Interval,
+    prepost: bool,
+    exc: BaseException | None = None,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {"symbol": symbol, "period": period, "interval": interval, "prepost": prepost}
+    if exc is not None:
+        details["exception"] = str(exc)
+    return details
+
+
+def _create_price_history_no_data_response(
+    symbol: str,
+    period: Period,
+    interval: Interval,
+    prepost: bool,
+    exc: BaseException | None = None,
+) -> str:
+    return create_error_response(
+        f"No price data available for '{symbol}' with period='{period}' and interval='{interval}'. "
+        "Common issues: (1) Invalid symbol, (2) Incompatible period/interval combination "
+        "(e.g., '1m' interval requires '1d' or '5d' period), (3) Market holidays or insufficient history. "
+        "Try a longer period or daily interval.",
+        error_code="NO_DATA",
+        details=_price_history_details(symbol, period, interval, prepost, exc),
+    )
+
+
+def _create_price_history_api_error_response(
+    symbol: str,
+    period: Period,
+    interval: Interval,
+    prepost: bool,
+    exc: BaseException,
+) -> str:
+    return create_error_response(
+        f"Failed to fetch price history for '{symbol}'. "
+        "Verify the symbol is correct and the period/interval combination is valid.",
+        error_code="API_ERROR",
+        details=_price_history_details(symbol, period, interval, prepost, exc),
+    )
+
+
+def _is_price_history_rate_limit_message(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        indicator in normalized
+        for indicator in (
+            "too many requests",
+            "rate limit",
+            "rate-limit",
+            "ratelimit",
+            "status_code = 429",
+            "status_code=429",
+        )
+    )
+
+
+def _is_price_history_no_data_prices_missing_error(exc: YFPricesMissingError) -> bool:
+    debug_info = str(getattr(exc, "debug_info", "") or "").lower()
+
+    if "yahoo status_code" in debug_info:
+        return False
+
+    if "yahoo error" in debug_info:
+        return any(
+            indicator in debug_info
+            for indicator in (
+                "no data found",
+                "symbol may be delisted",
+                "possibly delisted",
+            )
+        )
+
+    return True
+
+
+def _create_price_history_prices_missing_error_response(
+    symbol: str,
+    period: Period,
+    interval: Interval,
+    prepost: bool,
+    exc: YFPricesMissingError,
+) -> str:
+    rate_limit_context = f"{getattr(exc, 'debug_info', '')} {getattr(exc, 'rationale', '')}"
+    if _is_price_history_rate_limit_message(rate_limit_context):
+        return create_error_response(
+            f"Rate limit reached while fetching price history for '{symbol}'. Try again later.",
+            error_code="NETWORK_ERROR",
+            details=_price_history_details(symbol, period, interval, prepost, exc),
+        )
+
+    if _is_price_history_no_data_prices_missing_error(exc):
+        return _create_price_history_no_data_response(symbol, period, interval, prepost, exc)
+
+    return _create_price_history_api_error_response(symbol, period, interval, prepost, exc)
+
+
 def _select_retryable_exception(exceptions: list[Exception]) -> BaseException:
     rate_limit_exception = next((exc for exc in exceptions if _is_rate_limit_error(exc)), None)
     return rate_limit_exception or exceptions[0]
+
+
+def _normalize_json_value(value: Any) -> Any:
+    """Replace non-finite numeric values recursively so responses remain strict JSON."""
+    if isinstance(value, dict):
+        return {key: _normalize_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(item) for item in value]
+    if isinstance(value, Real) and not math.isfinite(float(value)):
+        return None
+    return value
+
+
+def _dataframe_records(
+    frame: Any,
+    max_rows: int,
+    *,
+    include_index: bool,
+    index_name: str | None = None,
+    sort_descending: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    prepared = frame.copy()
+    if sort_descending:
+        prepared = prepared.sort_index(ascending=False)
+    if include_index:
+        if index_name is not None:
+            prepared.index.name = index_name
+        prepared = prepared.reset_index()
+
+    total_rows = len(prepared)
+    limited = prepared if max_rows == 0 else prepared.head(max_rows)
+    limited = limited.astype(object).where(limited.notna(), None)
+    records = _normalize_json_value(limited.to_dict(orient="records"))
+    return records, {
+        "total_rows": total_rows,
+        "returned_rows": len(records),
+        "truncated": len(records) < total_rows,
+    }
+
+
+def _serialize_fund_section(value: Any, max_rows: int) -> tuple[Any, dict[str, Any] | None] | None:
+    if value is None or (hasattr(value, "empty") and value.empty):
+        return None
+    if isinstance(value, (dict, list, str)) and not value:
+        return None
+    if hasattr(value, "columns") and hasattr(value, "index"):
+        records, metadata = _dataframe_records(value, max_rows, include_index=True)
+        return records, metadata
+    return _normalize_json_value(value), None
+
+
+async def _fetch_fund_sections(
+    funds_data: Any,
+    selected_sections: list[str],
+    max_rows: int,
+) -> tuple[dict[str, Any], dict[str, Any], list[str], list[tuple[str, Exception]]]:
+    response: dict[str, Any] = {}
+    section_metadata: dict[str, Any] = {}
+    unavailable_sections: list[str] = []
+    fetch_errors: list[tuple[str, Exception]] = []
+
+    for section in selected_sections:
+        try:
+            value = await asyncio.to_thread(lambda section=section: getattr(funds_data, section))
+            serialized = _serialize_fund_section(value, max_rows)
+            if serialized is None:
+                unavailable_sections.append(section)
+                continue
+            response[section], metadata = serialized
+            if metadata is not None:
+                section_metadata[section] = metadata
+        except YFDataException:
+            unavailable_sections.append(section)
+        except Exception as exc:
+            fetch_errors.append((section, exc))
+
+    return response, section_metadata, unavailable_sections, fetch_errors
+
+
+def _validate_sections(
+    sections: list[str] | None,
+    valid_sections: set[str],
+    *,
+    max_rows: int,
+) -> tuple[list[str] | None, str | None]:
+    if max_rows < 0:
+        return None, create_error_response(
+            "max_rows must be greater than or equal to 0.",
+            error_code="INVALID_PARAMS",
+            details={"max_rows": max_rows},
+        )
+    if sections is not None and not sections:
+        return None, create_error_response(
+            "sections must include at least one section when provided.",
+            error_code="INVALID_PARAMS",
+            details={"sections": sections, "valid_sections": sorted(valid_sections)},
+        )
+
+    selected = sorted(valid_sections) if sections is None else list(dict.fromkeys(sections))
+    invalid = sorted(set(selected).difference(valid_sections))
+    if invalid:
+        return None, create_error_response(
+            "One or more requested sections are invalid.",
+            error_code="INVALID_PARAMS",
+            details={"invalid_sections": invalid, "valid_sections": sorted(valid_sections)},
+        )
+    return selected, None
+
+
+def _section_fetch_error_response(
+    symbol: str,
+    subject: str,
+    selected_sections: list[str],
+    fetch_errors: list[tuple[str, Exception]],
+) -> str:
+    retryable = [exc for _, exc in fetch_errors if _is_retryable_yfinance_error(exc)]
+    failed_sections = [section for section, _ in fetch_errors]
+    details: dict[str, Any] = {
+        "symbol": symbol,
+        "requested_sections": selected_sections,
+        "failed_sections": failed_sections,
+    }
+    if retryable:
+        return _create_retryable_error_response(
+            f"fetching {subject} for '{symbol}'",
+            _select_retryable_exception(retryable),
+            details,
+        )
+    details["exception"] = str(fetch_errors[0][1])
+    return create_error_response(
+        f"Failed to fetch {subject} for '{symbol}'.",
+        error_code="API_ERROR",
+        details=details,
+    )
 
 
 def _create_option_dates_fetch_error(symbol: str, exc: Exception, api_message: str) -> str:
@@ -179,6 +441,324 @@ async def get_ticker_info(
                 logger.error("Unable to convert {}: {} to datetime: {}", key, value, exc)
 
     return dump_json(info)
+
+
+@mcp.tool(
+    name="yfinance_get_analyst_price_targets",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_analyst_price_targets(
+    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+) -> str:
+    """Fetch the current price and analyst consensus price targets for a stock.
+
+    Returns a JSON object with the fields supplied by Yahoo Finance:
+    - current: Current market price
+    - low: Lowest analyst price target
+    - high: Highest analyst price target
+    - mean: Mean analyst price target
+    - median: Median analyst price target
+
+    Analyst coverage and available fields vary by symbol.
+    """
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        targets = await asyncio.to_thread(lambda: ticker.analyst_price_targets)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(
+            f"fetching analyst price targets for '{symbol}'",
+            exc,
+            {"symbol": symbol},
+        )
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch analyst price targets for '{symbol}'. Verify the symbol is correct.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    if not targets:
+        return create_error_response(
+            f"No analyst price targets available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol},
+        )
+
+    cleaned_targets: dict[str, Any] = {}
+    for key, value in targets.items():
+        if value is None:
+            cleaned_targets[key] = None
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            cleaned_targets[key] = value
+            continue
+        cleaned_targets[key] = None if numeric != numeric else numeric
+
+    return dump_json(cleaned_targets)
+
+
+@mcp.tool(
+    name="yfinance_get_analyst_estimates",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_analyst_estimates(
+    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    sections: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional analyst sections: recommendations, earnings_estimate, revenue_estimate, eps_trend, "
+                "eps_revisions, earnings_history, and growth_estimates. Omit to return all sections."
+            )
+        ),
+    ] = None,
+    max_rows: Annotated[
+        int,
+        Field(description="Maximum rows per section. Use 0 to return all rows."),
+    ] = 12,
+) -> str:
+    """Fetch consensus estimates, EPS/revenue trends, revisions, recommendations, and earnings history."""
+    selected_sections, validation_error = _validate_sections(
+        sections,
+        set(_ANALYST_ESTIMATE_SECTIONS),
+        max_rows=max_rows,
+    )
+    if validation_error is not None:
+        return validation_error
+    assert selected_sections is not None
+
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(
+            f"fetching analyst estimates for '{symbol}'",
+            exc,
+            {"symbol": symbol},
+        )
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch analyst estimates for '{symbol}'.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    response: dict[str, Any] = {}
+    section_metadata: dict[str, Any] = {}
+    unavailable_sections: list[str] = []
+    fetch_errors: list[tuple[str, Exception]] = []
+
+    for section in selected_sections:
+        attribute, index_name, sort_descending = _ANALYST_ESTIMATE_SECTIONS[section]
+        try:
+            frame = await asyncio.to_thread(lambda attribute=attribute: getattr(ticker, attribute))
+            if frame is None or frame.empty:
+                unavailable_sections.append(section)
+                continue
+            records, metadata = _dataframe_records(
+                frame,
+                max_rows,
+                include_index=index_name is not None,
+                index_name=index_name,
+                sort_descending=sort_descending,
+            )
+            response[section] = records
+            section_metadata[section] = metadata
+        except Exception as exc:
+            fetch_errors.append((section, exc))
+
+    if not response:
+        if fetch_errors:
+            return _section_fetch_error_response(
+                symbol,
+                "analyst estimates",
+                selected_sections,
+                fetch_errors,
+            )
+        return create_error_response(
+            f"No analyst estimates available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol, "requested_sections": selected_sections},
+        )
+
+    response["_metadata"] = {
+        "symbol": symbol,
+        "max_rows": max_rows,
+        "requested_sections": selected_sections,
+        "sections": section_metadata,
+        "unavailable_sections": unavailable_sections,
+        "failed_sections": [section for section, _ in fetch_errors],
+    }
+    return dump_json(response)
+
+
+@mcp.tool(
+    name="yfinance_get_fund_data",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_fund_data(
+    symbol: Annotated[str, Field(description="ETF or mutual fund ticker symbol (e.g., 'SPY', 'BND', 'VFIAX')")],
+    sections: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional fund sections: description, fund_overview, fund_operations, asset_classes, "
+                "top_holdings, equity_holdings, bond_holdings, bond_ratings, and sector_weightings. "
+                "Omit to return all sections."
+            )
+        ),
+    ] = None,
+    max_rows: Annotated[
+        int,
+        Field(description="Maximum rows per tabular section. Use 0 to return all rows."),
+    ] = 25,
+) -> str:
+    """Fetch ETF or mutual-fund composition, holdings, exposures, ratings, and operating details."""
+    selected_sections, validation_error = _validate_sections(
+        sections,
+        _FUND_DATA_SECTIONS,
+        max_rows=max_rows,
+    )
+    if validation_error is not None:
+        return validation_error
+    assert selected_sections is not None
+
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        funds_data = await asyncio.to_thread(lambda: ticker.funds_data)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(f"fetching fund data for '{symbol}'", exc, {"symbol": symbol})
+    except YFDataException as exc:
+        return create_error_response(
+            f"No fund data available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch fund data for '{symbol}'. Verify that the symbol is an ETF or mutual fund.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    response, section_metadata, unavailable_sections, fetch_errors = await _fetch_fund_sections(
+        funds_data,
+        selected_sections,
+        max_rows,
+    )
+
+    if not response:
+        if fetch_errors:
+            return _section_fetch_error_response(symbol, "fund data", selected_sections, fetch_errors)
+        return create_error_response(
+            f"No fund data available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol, "requested_sections": selected_sections},
+        )
+
+    response["_metadata"] = {
+        "symbol": symbol,
+        "max_rows": max_rows,
+        "requested_sections": selected_sections,
+        "sections": section_metadata,
+        "unavailable_sections": unavailable_sections,
+        "failed_sections": [section for section, _ in fetch_errors],
+    }
+    return dump_json(response)
+
+
+@mcp.tool(
+    name="yfinance_get_upgrades_downgrades",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_upgrades_downgrades(
+    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    max_rows: Annotated[
+        int,
+        Field(description="Maximum analyst actions to return, newest first. Use 0 to return all rows."),
+    ] = 25,
+) -> str:
+    """Fetch analyst upgrades, downgrades, initiations, and price target changes.
+
+    Returns analyst actions newest first. Fields supplied by Yahoo Finance can include:
+    - GradeDate: Date and time of the analyst action
+    - Firm: Analyst firm name
+    - ToGrade and FromGrade: New and previous ratings
+    - Action: Rating action, such as upgrade, downgrade, initiation, or reiteration
+    - priceTargetAction: Price target action, such as Raises, Lowers, or Maintains
+    - currentPriceTarget and priorPriceTarget: New and previous price targets
+
+    Available fields vary by symbol and analyst action.
+    """
+    if max_rows < 0:
+        return create_error_response(
+            "max_rows must be greater than or equal to 0.",
+            error_code="INVALID_PARAMS",
+            details={"max_rows": max_rows},
+        )
+
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        history = await asyncio.to_thread(lambda: ticker.upgrades_downgrades)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(
+            f"fetching upgrades and downgrades for '{symbol}'",
+            exc,
+            {"symbol": symbol},
+        )
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch upgrades and downgrades for '{symbol}'. Verify the symbol is correct.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    if history is None or history.empty:
+        return create_error_response(
+            f"No upgrades or downgrades available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol},
+        )
+
+    history = history.sort_index(ascending=False).reset_index()
+    total_rows = len(history)
+    limited_history = history if max_rows == 0 else history.head(max_rows)
+    limited_history = limited_history.astype(object).where(limited_history.notna(), None)
+    records = limited_history.to_dict(orient="records")
+
+    return dump_json(
+        {
+            "upgrades_downgrades": records,
+            "_metadata": {
+                "symbol": symbol,
+                "max_rows": max_rows,
+                "total_rows": total_rows,
+                "returned_rows": len(records),
+                "truncated": len(records) < total_rows,
+            },
+        }
+    )
 
 
 @mcp.tool(
@@ -316,13 +896,13 @@ async def screen(
         Field(
             description=(
                 "Screener query. For query_type='predefined': string key like 'day_gainers'. "
-                "For query_type='equity' or 'fund': query tree object with {operator, operands} nodes."
+                "For query_type='equity', 'fund', or 'etf': query tree object with {operator, operands} nodes."
             )
         ),
     ],
     query_type: Annotated[
         ScreenerQueryType,
-        Field(description="Query mode: 'predefined', 'equity', or 'fund'."),
+        Field(description="Query mode: 'predefined', 'equity', 'fund', or 'etf'."),
     ] = "predefined",
     offset: Annotated[int | None, Field(description="Result offset.", ge=0)] = None,
     size: Annotated[
@@ -340,7 +920,7 @@ async def screen(
 ) -> str:
     """Run a Yahoo Finance screener query.
 
-    Supports predefined Yahoo screener keys and custom equity or fund query trees.
+    Supports predefined Yahoo screener keys and custom equity, mutual-fund, or ETF query trees.
     """
     try:
         if query_type == "predefined" and size is not None:
@@ -349,9 +929,9 @@ async def screen(
                 error_code="INVALID_PARAMS",
                 details={"query_type": query_type, "invalid_parameter": "size", "expected_parameter": "count"},
             )
-        if query_type in {"equity", "fund"} and count is not None:
+        if query_type in {"equity", "fund", "etf"} and count is not None:
             return create_error_response(
-                "For query_type='equity' or 'fund', use size instead of count.",
+                "For query_type='equity', 'fund', or 'etf', use size instead of count.",
                 error_code="INVALID_PARAMS",
                 details={"query_type": query_type, "invalid_parameter": "count", "expected_parameter": "size"},
             )
@@ -380,19 +960,21 @@ async def screen(
         else:
             if not isinstance(query, dict):
                 return create_error_response(
-                    "For query_type='equity' or 'fund', query must be an object with 'operator' and 'operands'.",
+                    "For query_type='equity', 'fund', or 'etf', query must be an object with "
+                    "'operator' and 'operands'.",
                     error_code="INVALID_PARAMS",
                     details={"query_type": query_type, "expected_query_type": "object"},
                 )
 
             resolved_query = build_screener_query(query_type=query_type, query=query)
 
+        upstream_size = count if query_type == "predefined" else size
         result = await asyncio.to_thread(
             yf.screen,
             resolved_query,
             offset=offset,
-            size=size,
-            count=count,
+            size=upstream_size,
+            count=None,
             sortField=sort_field,
             sortAsc=sort_asc,
             userId=user_id,
@@ -864,36 +1446,23 @@ async def get_price_history(
             interval=interval,
             prepost=prepost,
             rounding=True,
+            raise_errors=True,
         )
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(
             f"fetching price history for '{symbol}'",
             exc,
-            {"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
+            _price_history_details(symbol, period, interval, prepost),
         )
+    except (YFTzMissingError, YFInvalidPeriodError) as exc:
+        return _create_price_history_no_data_response(symbol, period, interval, prepost, exc)
+    except YFPricesMissingError as exc:
+        return _create_price_history_prices_missing_error_response(symbol, period, interval, prepost, exc)
     except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch price history for '{symbol}'. "
-            "Verify the symbol is correct and the period/interval combination is valid.",
-            error_code="API_ERROR",
-            details={
-                "symbol": symbol,
-                "period": period,
-                "interval": interval,
-                "prepost": prepost,
-                "exception": str(exc),
-            },
-        )
+        return _create_price_history_api_error_response(symbol, period, interval, prepost, exc)
 
     if df.empty:
-        return create_error_response(
-            f"No price data available for '{symbol}' with period='{period}' and interval='{interval}'. "
-            "Common issues: (1) Invalid symbol, (2) Incompatible period/interval combination "
-            "(e.g., '1m' interval requires '1d' or '5d' period), (3) Market holidays or insufficient history. "
-            "Try a longer period or daily interval.",
-            error_code="NO_DATA",
-            details={"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
-        )
+        return _create_price_history_no_data_response(symbol, period, interval, prepost)
 
     if chart_type is None:
         return df.to_markdown()

@@ -1,5 +1,7 @@
 # Yahoo Finance MCP Server
 
+<!-- mcp-name: io.github.narumiruna/yfinance-mcp -->
+
 [![PyPI version](https://img.shields.io/pypi/v/yfmcp)](https://pypi.org/project/yfmcp/)
 [![Python](https://img.shields.io/pypi/pyversions/yfmcp.svg)](https://pypi.org/project/yfmcp/)
 [![CI](https://github.com/narumiruna/yfinance-mcp/actions/workflows/python.yml/badge.svg)](https://github.com/narumiruna/yfinance-mcp/actions/workflows/python.yml)
@@ -14,6 +16,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 ## Features
 
 - **Stock Data** — Company info, financials, valuation metrics, dividends, and trading data
+- **Analyst Data** — Consensus targets, estimate/revision trends, recommendation history, and firm-level actions
 - **Financial Statements** — Income statement and balance sheet with historical data (EBIT, Invested Capital, etc.)
 - **Financial News** — Recent news articles and press releases for any ticker
 - **Search** — Find stocks, ETFs, and news across Yahoo Finance
@@ -22,6 +25,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 - **Chart Generation** — Candlestick, VWAP, and volume profile charts returned as WebP images
 - **Options Data** — Option chains with calls, puts, strike prices, IV, and expiration dates
 - **Ownership Data** — Major holders, institutional investors, mutual fund holders, and insider transactions
+- **Fund Look-Through** — ETF and mutual-fund holdings, asset classes, sectors, ratings, and operating details
+- **Screeners** — Predefined, equity, mutual-fund, and ETF query trees
 
 ## Tools
 
@@ -34,6 +39,48 @@ Retrieve comprehensive stock data including company info, financials, trading me
 | `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `GOOGL`, `MSFT`) |
 
 **Returns:** JSON object with company details, price data, valuation metrics, trading info, dividends, financials, and performance indicators.
+
+### `yfinance_get_analyst_price_targets`
+
+Fetch the current price and analyst consensus price targets for a stock.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `GOOGL`, `MSFT`) |
+
+**Returns:** JSON object with `current`, `low`, `high`, `mean`, and `median` price fields. Analyst coverage and available fields vary by symbol.
+
+### `yfinance_get_analyst_estimates`
+
+Fetch analyst consensus estimates, revision momentum, recommendations, growth estimates, and earnings history.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Stock ticker symbol |
+| `sections` | array | No | Any of `recommendations`, `earnings_estimate`, `revenue_estimate`, `eps_trend`, `eps_revisions`, `earnings_history`, or `growth_estimates`. Omit for all sections |
+| `max_rows` | number | No | Maximum rows per section. Default: `12`. Use `0` for all rows |
+
+**Returns:** Named arrays for available sections plus `_metadata` containing per-section row counts, truncation status, unavailable sections, and failed sections. A failure in one section does not discard successfully fetched sections.
+
+### `yfinance_get_upgrades_downgrades`
+
+Fetch analyst upgrades, downgrades, initiations, reiterations, and price-target changes, newest first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Stock ticker symbol |
+| `max_rows` | number | No | Maximum actions to return. Default: `25`. Use `0` to return all rows |
+
+**Returns:** JSON object containing `upgrades_downgrades` records and `_metadata` with row counts and truncation status. Records can include:
+
+- `GradeDate`: Date and time of the analyst action
+- `Firm`: Analyst firm name
+- `ToGrade` and `FromGrade`: New and previous ratings
+- `Action`: Rating action
+- `priceTargetAction`: Price-target action such as `Raises`, `Lowers`, or `Maintains`
+- `currentPriceTarget` and `priorPriceTarget`: New and previous price targets
+
+Available fields vary by symbol and analyst action.
 
 ### `yfinance_get_ticker_news`
 
@@ -78,8 +125,8 @@ Run Yahoo Finance screeners using either predefined screener keys or custom quer
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `query` | string/object | Yes | For `query_type="predefined"`: screener key such as `"day_gainers"`. For `query_type="equity"` or `"fund"`: custom query tree with `{operator, operands}` nodes |
-| `query_type` | string | No | `"predefined"` (default), `"equity"`, or `"fund"` |
+| `query` | string/object | Yes | For `query_type="predefined"`: screener key such as `"day_gainers"`. For `query_type="equity"`, `"fund"`, or `"etf"`: custom query tree with `{operator, operands}` nodes |
+| `query_type` | string | No | `"predefined"` (default), `"equity"`, `"fund"`, or `"etf"` |
 | `offset` | number | No | Result offset |
 | `size` | number | No | Rows for custom queries; Yahoo maximum is `250` |
 | `count` | number | No | Rows for predefined queries; Yahoo maximum is `250` |
@@ -107,6 +154,24 @@ Custom equity screener example:
   "sort_field": "percentchange",
   "sort_asc": false,
   "size": 50
+}
+```
+
+Custom ETF screener example:
+
+```json
+{
+  "query_type": "etf",
+  "query": {
+    "operator": "and",
+    "operands": [
+      { "operator": "eq", "operands": ["categoryname", "Large Blend"] },
+      { "operator": "lte", "operands": ["annualreportnetexpenseratio", 0.2] }
+    ]
+  },
+  "sort_field": "fundnetassets",
+  "sort_asc": false,
+  "size": 25
 }
 ```
 
@@ -185,6 +250,18 @@ Fetch major holders, institutional holders, mutual fund holders, and insider dat
 - **`_metadata`** — Row limit metadata with `max_rows` and per-section `total_rows`, `returned_rows`, and `truncated`
 
 Holder sections are limited to 10 rows by default to keep responses concise. Pass `max_rows: 0` when you need the complete holder datasets. Field names for holder-related datasets are provided by `yfinance` and may vary by ticker, data availability, and `yfinance` version.
+
+### `yfinance_get_fund_data`
+
+Fetch ETF or mutual-fund portfolio composition and operating details.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | ETF or mutual-fund ticker symbol (for example `SPY`, `BND`, or `VFIAX`) |
+| `sections` | array | No | Any of `description`, `fund_overview`, `fund_operations`, `asset_classes`, `top_holdings`, `equity_holdings`, `bond_holdings`, `bond_ratings`, or `sector_weightings`. Omit for all sections |
+| `max_rows` | number | No | Maximum rows per tabular section. Default: `25`. Use `0` for all rows |
+
+**Returns:** Available fund sections plus `_metadata` with row limits, per-section truncation, unavailable sections, and failed sections. The mix of sections depends on the fund; for example, equity funds and bond funds expose different portfolio breakdowns.
 
 ### `yfinance_get_option_dates`
 
